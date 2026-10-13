@@ -270,6 +270,20 @@ func runACPHelper(stdin *os.File, stdout *os.File) {
 	for scanner.Scan() {
 		var msg helperEnvelope
 		must(json.Unmarshal(scanner.Bytes(), &msg))
+		if path := os.Getenv("GO_METHOD_LOG"); path != "" {
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+			must(err)
+			_, err = f.WriteString(msg.Method + "\n")
+			must(err)
+			must(f.Close())
+		}
+		if msg.Method == os.Getenv("GO_FAIL_METHOD") {
+			writeEnvelope(stdout, helperEnvelope{JSONRPC: "2.0", ID: msg.ID, Error: &helperError{Code: -32000, Message: "mcp unavailable"}})
+			continue
+		}
+		if msg.Method == os.Getenv("GO_HANG_METHOD") {
+			continue
+		}
 		switch msg.Method {
 		case acp.AgentMethodInitialize:
 			var req helperInitializeRequest

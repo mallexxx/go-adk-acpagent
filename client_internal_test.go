@@ -736,7 +736,7 @@ func TestAgentCloseWrapsClientError(t *testing.T) {
 
 	closed := make(chan struct{})
 	close(closed)
-	a := &Agent{client: &Client{
+	a := &Agent{cancelLifecycle: func() {}, initializationGate: make(chan struct{}, 1), client: &Client{
 		stdin:        testWriteCloser{},
 		closed:       closed,
 		closeErr:     errors.New("wait failed"),
