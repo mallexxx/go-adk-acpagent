@@ -8,6 +8,7 @@ import (
 	"iter"
 	"log/slog"
 	"strings"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 	adkagent "google.golang.org/adk/v2/agent"
@@ -21,6 +22,11 @@ type Config struct {
 	//
 	// Deprecated: Use NewWithContext to pass the lifecycle context explicitly.
 	Context context.Context
+	// LazyInitialization defers process launch and Initialize until the first invocation.
+	LazyInitialization bool
+	// SetupTimeout bounds Initialize and session attachment RPCs. Zero preserves
+	// the caller's deadline. This does not limit prompts or process lifetime.
+	SetupTimeout time.Duration
 	// Name is the display name of the agent. Defaults to "ACPAgent".
 	Name string
 	// Description describes the agent's purpose.
@@ -91,6 +97,14 @@ type Agent struct {
 	adkagent.Agent
 
 	client                    *Client
+	lifecycle                 context.Context
+	processContext            context.Context
+	protectAttachments        bool
+	cancelLifecycle           context.CancelFunc
+	clientConfig              ClientConfig
+	setupTimeout              time.Duration
+	initializationGate        chan struct{}
+	closed                    bool
 	workingDir                string
 	sessionConfig             []SessionConfigValue
 	reasoningEffort           string
@@ -121,7 +135,8 @@ var _ adkagent.Agent = (*Agent)(nil)
 
 // New creates an ADK agent backed by an ACP client process.
 //
-// It starts the ACP process, performs ACP initialization, and creates ACP
+// By default it starts the ACP process and performs ACP initialization.
+// Config.LazyInitialization defers both until the first invocation. It creates ACP
 // sessions lazily per ADK session.
 //
 // Per ADK session, callers may provide state overrides:
@@ -176,33 +191,26 @@ func newAgent(ctx context.Context, cfg Config) (*Agent, error) {
 
 	l := newLogger(cfg.Logger, "acpagent.agent").withContext(ctx)
 
-	client, err := NewClient(ctx, ClientConfig{
-		Command:           cfg.Command,
-		WorkingDir:        cfg.WorkingDir,
-		ClientName:        cfg.ClientName,
-		ClientVersion:     cfg.ClientVersion,
-		Stderr:            cfg.Stderr,
-		PermissionHandler: protocolPermissionHandler(cfg.PermissionHandler),
-		Logger:            cfg.Logger,
-	})
-	if err != nil {
-		return nil, err
+	if len(cfg.Command) == 0 {
+		return nil, errors.New("acp command is required")
 	}
-	initResp, err := client.Initialize(ctx)
-	if err != nil {
-		err = fmt.Errorf("initialize acp client: %w", err)
-		return nil, closeClientAfterError(client, err, "close acp client after initialize failure")
+	if cfg.SetupTimeout < 0 {
+		return nil, errors.New("setup timeout must not be negative")
 	}
-	promptSupport := promptSupportFromCapabilities(initResp.AgentCapabilities.PromptCapabilities)
-
 	mcpServers, err := convertMCPServers(cfg.MCPServers)
 	if err != nil {
-		err = fmt.Errorf("convert mcp servers: %w", err)
-		return nil, closeClientAfterError(client, err, "close acp client after mcp config conversion failure")
+		return nil, fmt.Errorf("convert mcp servers: %w", err)
+	}
+	lifecycle, cancelLifecycle := context.WithCancel(ctx)
+	clientConfig := ClientConfig{
+		Command: append([]string(nil), cfg.Command...), WorkingDir: cfg.WorkingDir,
+		ClientName: cfg.ClientName, ClientVersion: cfg.ClientVersion, Stderr: cfg.Stderr,
+		PermissionHandler: protocolPermissionHandler(cfg.PermissionHandler), Logger: cfg.Logger,
 	}
 
 	a := &Agent{
-		client:                    client,
+		lifecycle: lifecycle, processContext: ctx, protectAttachments: cfg.LazyInitialization || cfg.SetupTimeout > 0, cancelLifecycle: cancelLifecycle, clientConfig: clientConfig,
+		setupTimeout: cfg.SetupTimeout, initializationGate: make(chan struct{}, 1),
 		workingDir:                cfg.WorkingDir,
 		sessionConfig:             normalizeSessionConfigValues(cfg.SessionConfig),
 		reasoningEffort:           strings.TrimSpace(cfg.ReasoningEffort),
@@ -213,7 +221,6 @@ func newAgent(ctx context.Context, cfg Config) (*Agent, error) {
 		globalInstructionProvider: cfg.GlobalInstructionProvider,
 		logger:                    l,
 		mcpServers:                mcpServers,
-		promptSupport:             promptSupport,
 	}
 	base, err := adkagent.New(adkagent.Config{
 		Name:                 cfg.Name,
@@ -224,22 +231,85 @@ func newAgent(ctx context.Context, cfg Config) (*Agent, error) {
 	})
 	if err != nil {
 		err = fmt.Errorf("create adk acp agent: %w", err)
-		return nil, closeClientAfterError(client, err, "close acp client after adk agent creation failure")
+		cancelLifecycle()
+		return nil, err
 	}
 	a.Agent = base
+	if !cfg.LazyInitialization {
+		if err := a.ensureInitialized(ctx); err != nil {
+			cancelLifecycle()
+			return nil, err
+		}
+	}
 	return a, nil
 }
 
 // Close shuts down the underlying ACP client process.
 func (a *Agent) Close() error {
-	if err := a.client.Close(); err != nil {
-		return fmt.Errorf("close acp client: %w", err)
+	a.cancelLifecycle()
+	a.initializationGate <- struct{}{}
+	defer func() { <-a.initializationGate }()
+	a.closed = true
+	if a.client != nil {
+		if err := a.client.Close(); err != nil {
+			return fmt.Errorf("close acp client: %w", err)
+		}
 	}
+	return nil
+}
+
+func (a *Agent) setupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if a.setupTimeout > 0 {
+		return context.WithTimeout(ctx, a.setupTimeout)
+	}
+	return context.WithCancel(ctx)
+}
+
+func (a *Agent) ensureInitialized(ctx context.Context) error {
+	setup, cancel := a.setupContext(ctx)
+	defer cancel()
+	select {
+	case a.initializationGate <- struct{}{}:
+	case <-setup.Done():
+		return setup.Err()
+	case <-a.lifecycle.Done():
+		return a.lifecycle.Err()
+	}
+	defer func() { <-a.initializationGate }()
+	if a.closed {
+		return errors.New("acp agent is closed")
+	}
+	if a.client != nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	client, err := NewClient(a.processContext, a.clientConfig)
+	if err != nil {
+		return err
+	}
+	// Closing the agent must cancel a setup even when its invocation is live.
+	stop := context.AfterFunc(a.lifecycle, cancel)
+	defer stop()
+	resp, err := client.Initialize(setup)
+	if err != nil {
+		if setup.Err() != nil {
+			err = setup.Err()
+		}
+		return closeClientAfterError(client, fmt.Errorf("initialize acp client: %w", err), "close acp client after initialize failure")
+	}
+	a.client = client
+	a.promptSupport = promptSupportFromCapabilities(resp.AgentCapabilities.PromptCapabilities)
 	return nil
 }
 
 func (a *Agent) run(ctx adkagent.InvocationContext) iter.Seq2[*session.Event, error] {
 	return func(yield func(*session.Event, error) bool) {
+		if err := a.ensureInitialized(ctx); err != nil {
+			yield(nil, err)
+			return
+		}
 		baseLogger := a.invocationLogger(ctx)
 
 		prompt, err := promptContentBlocks(ctx.UserContent(), a.promptSupport)
@@ -251,7 +321,7 @@ func (a *Agent) run(ctx adkagent.InvocationContext) iter.Seq2[*session.Event, er
 		adkSessionID := ctx.Session().ID()
 		logCtx, logger := a.sessionLogger(ctx, baseLogger, adkSessionID)
 
-		remote, err := a.ensureRemoteSession(ctx, logCtx, logger)
+		remote, err := a.ensureRemoteSession(ctx, logCtx, logger, yield)
 		if err != nil {
 			yield(nil, err)
 			return
@@ -277,7 +347,7 @@ func (a *Agent) run(ctx adkagent.InvocationContext) iter.Seq2[*session.Event, er
 			return
 		}
 		if err != nil && isACPSessionNotFoundError(err) {
-			recovered, recoverErr := a.recoverRemoteSession(ctx, logCtx, logger, err)
+			recovered, recoverErr := a.recoverRemoteSession(ctx, logCtx, logger, err, yield)
 			if recoverErr != nil {
 				yield(nil, recoverErr)
 				return

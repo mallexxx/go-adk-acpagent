@@ -34,13 +34,18 @@ func BooleanSessionConfigValue(id string, value bool) SessionConfigValue {
 	return SessionConfigValue{ID: id, BoolValue: &value}
 }
 
+// ErrSessionAttachmentIndeterminate means a canceled session/new may have
+// created a remote session. Reset the ADK session before attaching again.
+var ErrSessionAttachmentIndeterminate = errors.New("acp session attachment outcome is indeterminate; reset the session")
+
 type acpSessionConfig struct {
-	sessionID           string
-	configValues        []SessionConfigValue
-	desiredConfigValues []SessionConfigValue
-	cwd                 string
-	meta                map[string]any
-	metaJSON            string
+	attachmentIndeterminate bool
+	sessionID               string
+	configValues            []SessionConfigValue
+	desiredConfigValues     []SessionConfigValue
+	cwd                     string
+	meta                    map[string]any
+	metaJSON                string
 }
 
 type remoteSession struct {
@@ -97,12 +102,15 @@ func (a *Agent) persistSessionStateDelta(event *session.Event, remoteSessionID, 
 	event.Actions.StateDelta[SessionStateKey] = buildACPStateWithConfigValues(remoteSessionID, metaJSON, configValues)
 }
 
-func (a *Agent) ensureRemoteSession(ctx adkagent.InvocationContext, logCtx context.Context, logger logger) (remoteSession, error) {
+func (a *Agent) ensureRemoteSession(ctx adkagent.InvocationContext, logCtx context.Context, logger logger, yield func(*session.Event, error) bool) (remoteSession, error) {
 	cfg, err := a.resolveSessionConfig(ctx)
 	if err != nil {
 		return remoteSession{}, err
 	}
 
+	if cfg.attachmentIndeterminate {
+		return remoteSession{}, ErrSessionAttachmentIndeterminate
+	}
 	if cfg.sessionID != "" {
 		logger.Debug().
 			Str("acp_session_id", cfg.sessionID).
@@ -120,19 +128,24 @@ func (a *Agent) ensureRemoteSession(ctx adkagent.InvocationContext, logCtx conte
 	if err != nil {
 		return remoteSession{}, err
 	}
-	return a.createRemoteSession(ctx, logCtx, logger, cfg, instructions.combined())
+	return a.createRemoteSession(ctx, logCtx, logger, cfg, instructions.combined(), yield)
 }
 
-func (a *Agent) recoverRemoteSession(ctx adkagent.InvocationContext, logCtx context.Context, logger logger, promptErr error) (remoteSession, error) {
+func (a *Agent) recoverRemoteSession(ctx adkagent.InvocationContext, logCtx context.Context, logger logger, promptErr error, yield func(*session.Event, error) bool) (remoteSession, error) {
 	cfg, err := a.resolveSessionConfig(ctx)
 	if err != nil {
 		return remoteSession{}, err
 	}
 	if cfg.sessionID != "" && a.client.SupportsSessionResume() {
-		resumeResp, err := a.client.ResumeSessionWithMeta(logCtx, cfg.sessionID, cfg.cwd, a.mcpServers, cfg.meta)
+		setup, cancel := a.setupContext(logCtx)
+		defer cancel()
+		resumeResp, err := a.client.ResumeSessionWithMeta(setup, cfg.sessionID, cfg.cwd, a.mcpServers, cfg.meta)
+		if err != nil && setup.Err() != nil {
+			err = setup.Err()
+		}
 		if err == nil {
 			configValues, configErr := a.client.applySessionConfigRequired(
-				logCtx,
+				setup,
 				cfg.sessionID,
 				cfg.desiredConfigValues,
 				resumeResp.ConfigOptions,
@@ -182,22 +195,50 @@ func (a *Agent) recoverRemoteSession(ctx adkagent.InvocationContext, logCtx cont
 	if err != nil {
 		return remoteSession{}, err
 	}
-	recovered, err := a.createRemoteSession(ctx, logCtx, logger, cfg, instructions.combined())
+	recovered, err := a.createRemoteSession(ctx, logCtx, logger, cfg, instructions.combined(), yield)
 	if err != nil {
 		return remoteSession{}, fmt.Errorf("recover acp session after prompt failure %q: %w", promptErr, err)
 	}
 	return recovered, nil
 }
 
-func (a *Agent) createRemoteSession(ctx adkagent.InvocationContext, logCtx context.Context, logger logger, cfg acpSessionConfig, firstPromptInstructions string) (remoteSession, error) {
-	resp, err := a.client.NewSessionWithMeta(logCtx, cfg.cwd, a.mcpServers, cfg.meta)
-	if err != nil {
+func (a *Agent) createRemoteSession(ctx adkagent.InvocationContext, logCtx context.Context, logger logger, cfg acpSessionConfig, firstPromptInstructions string, yield func(*session.Event, error) bool) (remoteSession, error) {
+	setup, cancel := a.setupContext(logCtx)
+	defer cancel()
+	if err := setup.Err(); err != nil {
 		return remoteSession{}, err
 	}
+	// Persist the pending outcome before dispatch, while the invocation is live.
+	// Cancellation may prevent the runner from persisting any later event.
+	if a.protectAttachments {
+		if err := a.persistAttachmentOutcome(ctx, cfg, true, yield); err != nil {
+			return remoteSession{}, err
+		}
+	}
+	resp, err := a.client.NewSessionWithMeta(setup, cfg.cwd, a.mcpServers, cfg.meta)
+	if err != nil {
+		if setup.Err() != nil {
+			return remoteSession{}, setup.Err()
+		}
+		if a.protectAttachments {
+			if stateErr := a.persistAttachmentOutcome(ctx, cfg, false, yield); stateErr != nil {
+				return remoteSession{}, errors.Join(err, stateErr)
+			}
+		}
+		return remoteSession{}, err
+	}
+
 	sessionID := string(resp.SessionId)
+	if a.protectAttachments {
+		bound := cfg
+		bound.sessionID = sessionID
+		if err := a.persistAttachmentOutcome(ctx, bound, false, yield); err != nil {
+			return remoteSession{}, err
+		}
+	}
 	valuesToApply := mergeSessionConfigValues(cfg.configValues, cfg.desiredConfigValues)
 	configValues, configErr := a.client.applySessionConfigRequired(
-		logCtx,
+		setup,
 		sessionID,
 		valuesToApply,
 		resp.ConfigOptions,
@@ -487,6 +528,7 @@ func (a *Agent) resolveSessionConfig(ctx adkagent.InvocationContext) (acpSession
 	if !ok {
 		return acpSessionConfig{}, fmt.Errorf("adk session state %q must be an object; got %T", SessionStateKey, rawState)
 	}
+	cfg.attachmentIndeterminate, _ = state["attachment_indeterminate"].(bool)
 	if rawMeta, ok := state["meta"]; ok {
 		meta, ok := rawMeta.(map[string]any)
 		if !ok {
@@ -542,4 +584,22 @@ func normalizeACPConfigCWD(cfg acpSessionConfig) (acpSessionConfig, error) {
 	}
 	cfg.cwd = absCWD
 	return cfg, nil
+}
+
+func (a *Agent) persistAttachmentOutcome(ctx adkagent.InvocationContext, cfg acpSessionConfig, pending bool, yield func(*session.Event, error) bool) error {
+	state := buildACPStateWithConfigValues(cfg.sessionID, cfg.metaJSON, cfg.configValues)
+	if pending {
+		state["attachment_indeterminate"] = true
+	}
+	if err := ctx.Session().State().Set(SessionStateKey, state); err != nil {
+		return fmt.Errorf("persist attachment outcome: %w", err)
+	}
+	if yield != nil {
+		event := session.NewEvent(ctx, ctx.InvocationID())
+		event.Actions.StateDelta[SessionStateKey] = state
+		if !yield(event, nil) {
+			return context.Canceled
+		}
+	}
+	return nil
 }
