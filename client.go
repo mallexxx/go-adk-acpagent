@@ -83,6 +83,7 @@ type ExtendedSessionNotification struct {
 // to handle protocol-level callbacks and manages multiple concurrent prompt sessions.
 type Client struct {
 	ctx               context.Context
+	cancelProcess     context.CancelFunc
 	cmd               *exec.Cmd
 	stdin             io.WriteCloser
 	conn              *acp.ClientSideConnection
@@ -103,6 +104,8 @@ type Client struct {
 	closeOnce    sync.Once
 	closeErr     error
 	closing      atomic.Bool
+	shutdownOnce sync.Once
+	shutdownErr  error
 }
 
 type activePrompt struct {
@@ -162,6 +165,13 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 		stderr = io.Discard
 	}
 
+	ctx, cancelProcess := context.WithCancel(ctx)
+	keepProcess := false
+	defer func() {
+		if !keepProcess {
+			cancelProcess()
+		}
+	}()
 	cmd := exec.CommandContext(ctx, cfg.Command[0], cfg.Command[1:]...)
 	cmd.Dir = cfg.WorkingDir
 	stdin, err := cmd.StdinPipe()
@@ -190,6 +200,7 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 
 	c := &Client{
 		ctx:               ctx,
+		cancelProcess:     cancelProcess,
 		cmd:               cmd,
 		stdin:             stdin,
 		permissionHandler: cfg.PermissionHandler,
@@ -212,6 +223,7 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 
 	go c.dispatchUpdates()
 	go c.waitLoop()
+	keepProcess = true
 	return c, nil
 }
 
