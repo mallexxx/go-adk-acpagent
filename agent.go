@@ -24,8 +24,14 @@ type Config struct {
 	Context context.Context
 	// LazyInitialization defers process launch and Initialize until the first invocation.
 	LazyInitialization bool
-	// SetupTimeout bounds Initialize and session attachment RPCs. Zero preserves
-	// the caller's deadline. This does not limit prompts or process lifetime.
+	// InitializeTimeout bounds gate waiting, process launch and ACP initialize.
+	// Zero inherits SetupTimeout, including its zero/no-extra-deadline behavior.
+	// Negative values are invalid. It does not limit session attachment, prompts
+	// or the lifetime of a successfully initialized process.
+	InitializeTimeout time.Duration
+	// SetupTimeout bounds session attachment RPCs and is the default initialize
+	// budget when InitializeTimeout is zero. Zero preserves the caller's deadline.
+	// This does not limit prompts or process lifetime.
 	SetupTimeout time.Duration
 	// Name is the display name of the agent. Defaults to "ACPAgent".
 	Name string
@@ -103,6 +109,7 @@ type Agent struct {
 	cancelLifecycle           context.CancelFunc
 	clientConfig              ClientConfig
 	setupTimeout              time.Duration
+	initializeTimeout         time.Duration
 	initializationGate        chan struct{}
 	closed                    bool
 	workingDir                string
@@ -194,6 +201,12 @@ func newAgent(ctx context.Context, cfg Config) (*Agent, error) {
 	if len(cfg.Command) == 0 {
 		return nil, errors.New("acp command is required")
 	}
+	if cfg.InitializeTimeout < 0 {
+		return nil, errors.New("initialize timeout must not be negative")
+	}
+	if cfg.InitializeTimeout == 0 {
+		cfg.InitializeTimeout = cfg.SetupTimeout
+	}
 	if cfg.SetupTimeout < 0 {
 		return nil, errors.New("setup timeout must not be negative")
 	}
@@ -210,7 +223,7 @@ func newAgent(ctx context.Context, cfg Config) (*Agent, error) {
 
 	a := &Agent{
 		lifecycle: lifecycle, processContext: ctx, protectAttachments: cfg.LazyInitialization || cfg.SetupTimeout > 0, cancelLifecycle: cancelLifecycle, clientConfig: clientConfig,
-		setupTimeout: cfg.SetupTimeout, initializationGate: make(chan struct{}, 1),
+		setupTimeout: cfg.SetupTimeout, initializeTimeout: cfg.InitializeTimeout, initializationGate: make(chan struct{}, 1),
 		workingDir:                cfg.WorkingDir,
 		sessionConfig:             normalizeSessionConfigValues(cfg.SessionConfig),
 		reasoningEffort:           strings.TrimSpace(cfg.ReasoningEffort),
@@ -266,12 +279,21 @@ func (a *Agent) setupContext(ctx context.Context) (context.Context, context.Canc
 }
 
 func (a *Agent) ensureInitialized(ctx context.Context) error {
-	setup, cancel := a.setupContext(ctx)
+	var startup context.Context
+	var cancel context.CancelFunc
+	if a.initializeTimeout > 0 {
+		startup, cancel = context.WithTimeout(ctx, a.initializeTimeout)
+	} else {
+		startup, cancel = context.WithCancel(ctx)
+	}
 	defer cancel()
+	// Lifecycle cancellation applies while queued, launching, and initializing.
+	stopLifecycle := context.AfterFunc(a.lifecycle, cancel)
+	defer stopLifecycle()
 	select {
 	case a.initializationGate <- struct{}{}:
-	case <-setup.Done():
-		return setup.Err()
+	case <-startup.Done():
+		return startup.Err()
 	case <-a.lifecycle.Done():
 		return a.lifecycle.Err()
 	}
@@ -279,24 +301,41 @@ func (a *Agent) ensureInitialized(ctx context.Context) error {
 	if a.closed {
 		return errors.New("acp agent is closed")
 	}
+	if err := a.lifecycle.Err(); err != nil {
+		return err
+	}
+	if err := startup.Err(); err != nil {
+		return err
+	}
 	if a.client != nil {
 		return nil
 	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	client, err := NewClient(a.processContext, a.clientConfig)
+
+	// The startup operation may cancel a launching child, but a healthy child's
+	// lifetime must outlive the caller and its initialization deadline.
+	processContext, cancelProcess := context.WithCancel(a.processContext)
+	stopStartup := context.AfterFunc(startup, cancelProcess)
+	defer stopStartup()
+	client, err := NewClient(processContext, a.clientConfig)
 	if err != nil {
-		return err
-	}
-	// Closing the agent must cancel a setup even when its invocation is live.
-	stop := context.AfterFunc(a.lifecycle, cancel)
-	defer stop()
-	resp, err := client.Initialize(setup)
-	if err != nil {
-		if setup.Err() != nil {
-			err = setup.Err()
+		cancelProcess()
+		if cause := startup.Err(); cause != nil {
+			return fmt.Errorf("initialize acp client: %w", cause)
 		}
+		return err
+	}
+	clientCancel := client.cancelProcess
+	client.cancelProcess = func() { clientCancel(); cancelProcess() }
+	resp, err := client.Initialize(startup)
+	stopStartup()
+	// Cancellation can race a successful response. Never publish that client.
+	if cause := startup.Err(); cause != nil {
+		err = cause
+	}
+	if cause := a.lifecycle.Err(); cause != nil {
+		err = cause
+	}
+	if err != nil {
 		return closeClientAfterError(client, fmt.Errorf("initialize acp client: %w", err), "close acp client after initialize failure")
 	}
 	a.client = client

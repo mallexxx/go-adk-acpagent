@@ -16,9 +16,20 @@ func closeClientAfterError(client *Client, err error, closeMsg string) error {
 	return err
 }
 
-// Close shuts down the ACP subprocess and waits for the client to stop.
+// Close shuts down the owned ACP subprocess. It allows 200ms for graceful exit,
+// then kills the immediate child and waits up to 5s for cleanup. If cleanup
+// times out, the original reaper retains ownership until Wait completes.
+// Repeated and concurrent calls return the same result.
 func (c *Client) Close() error {
+	c.shutdownOnce.Do(func() { c.shutdownErr = c.closeProcess() })
+	return c.shutdownErr
+}
+
+func (c *Client) closeProcess() error {
 	c.closing.Store(true)
+	if c.cancelProcess != nil {
+		defer c.cancelProcess()
+	}
 	if err := c.stdin.Close(); err != nil && !isBenignStdinCloseErr(err) {
 		c.logger.Warn().Err(err).Msg("failed to close stdin")
 	}
@@ -27,13 +38,20 @@ func (c *Client) Close() error {
 		return c.finalizeCloseErr()
 	case <-time.After(200 * time.Millisecond):
 	}
+	if c.cancelProcess != nil {
+		c.cancelProcess()
+	}
 	if c.cmd.Process != nil {
 		if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			c.logger.Warn().Err(err).Msg("failed to kill acp process")
 		}
 	}
-	<-c.closed
-	return c.finalizeCloseErr()
+	select {
+	case <-c.closed:
+		return c.finalizeCloseErr()
+	case <-time.After(5 * time.Second):
+		return errors.New("acp client cleanup timeout: process wait did not finish within 5s after kill")
+	}
 }
 
 func (c *Client) waitLoop() {
