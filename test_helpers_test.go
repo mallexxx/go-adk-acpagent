@@ -19,7 +19,17 @@ func TestACPHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_ACP_HELPER") != "1" {
 		return
 	}
+	if path := os.Getenv("GO_PID_LOG"); path != "" {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		must(err)
+		_, err = fmt.Fprintln(f, os.Getpid())
+		must(err)
+		must(f.Close())
+	}
 	runACPHelper(os.Stdin, os.Stdout)
+	if os.Getenv("GO_IGNORE_STDIN_EOF") == "1" {
+		time.Sleep(time.Minute)
+	}
 	os.Exit(0)
 }
 
@@ -286,6 +296,11 @@ func runACPHelper(stdin *os.File, stdout *os.File) {
 		}
 		switch msg.Method {
 		case acp.AgentMethodInitialize:
+			if value := os.Getenv("GO_INITIALIZE_DELAY"); value != "" {
+				delay, err := time.ParseDuration(value)
+				must(err)
+				time.Sleep(delay)
+			}
 			var req helperInitializeRequest
 			must(json.Unmarshal(msg.Params, &req))
 			if expectedClientName != "" && req.ClientInfo.Name != expectedClientName {

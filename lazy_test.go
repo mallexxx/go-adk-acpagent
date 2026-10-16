@@ -58,7 +58,7 @@ func TestLazyInitializeTimeoutReapsAndAllowsLaterAttempt(t *testing.T) {
 }
 
 func TestLazyNewTimeoutPreventsDuplicateAttachment(t *testing.T) {
-	a, err := NewWithContext(t.Context(), Config{Command: helperCommandWithEnv(t, map[string]string{"GO_HANG_METHOD": "session/new"}), WorkingDir: t.TempDir(), LazyInitialization: true, SetupTimeout: 5 * time.Second})
+	a, err := NewWithContext(t.Context(), Config{Command: helperCommandWithEnv(t, map[string]string{"GO_HANG_METHOD": "session/new"}), WorkingDir: t.TempDir(), LazyInitialization: true, SetupTimeout: 100 * time.Millisecond, InitializeTimeout: 60 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,6 @@ func TestLazyNewTimeoutPreventsDuplicateAttachment(t *testing.T) {
 	if err := a.ensureInitialized(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	a.setupTimeout = 100 * time.Millisecond
 	svc := session.InMemoryService()
 	created, err := svc.Create(t.Context(), &session.CreateRequest{AppName: "lazy", UserID: "u"})
 	if err != nil {
@@ -91,9 +90,9 @@ func TestLazyNewTimeoutPreventsDuplicateAttachment(t *testing.T) {
 	}
 }
 
-func TestLazyFirstInvocationAttachesWithoutIdleRetry(t *testing.T) {
+func TestLazySlowFirstInvocationAttachesWithoutIdleRetry(t *testing.T) {
 	path := t.TempDir() + "/methods"
-	a, err := NewWithContext(t.Context(), Config{Command: helperCommandWithEnv(t, map[string]string{"GO_METHOD_LOG": path}), WorkingDir: t.TempDir(), LazyInitialization: true, SetupTimeout: time.Second})
+	a, err := NewWithContext(t.Context(), Config{Command: helperCommandWithEnv(t, map[string]string{"GO_METHOD_LOG": path, "GO_PID_LOG": path + ".pid", "GO_INITIALIZE_DELAY": "11s"}), WorkingDir: t.TempDir(), LazyInitialization: true, SetupTimeout: 10 * time.Second, InitializeTimeout: 60 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,16 +109,25 @@ func TestLazyFirstInvocationAttachesWithoutIdleRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := collectFinalText(t, r.Run(t.Context(), "u", created.Session.ID(), genai.NewContentFromText("hello", genai.RoleUser), agent.RunConfig{}))
-	if got != "session-1:hello" {
-		t.Fatalf("output=%q", got)
+	for range 2 {
+		got := collectFinalText(t, r.Run(t.Context(), "u", created.Session.ID(), genai.NewContentFromText("hello", genai.RoleUser), agent.RunConfig{}))
+		if got != "session-1:hello" {
+			t.Fatalf("output=%q", got)
+		}
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(data), "initialize\n") != 1 || strings.Count(string(data), "session/new\n") != 1 {
+	if strings.Count(string(data), "initialize\n") != 1 || strings.Count(string(data), "session/new\n") != 1 || strings.Count(string(data), "session/prompt\n") != 2 {
 		t.Fatalf("methods=%s", data)
+	}
+	pidData, err := os.ReadFile(path + ".pid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strings.Fields(string(pidData))) != 1 {
+		t.Fatalf("cold/warm turns launched multiple children: %s", pidData)
 	}
 }
 
@@ -132,7 +140,7 @@ func TestLazyResumeTimeoutPreservesKnownID(t *testing.T) {
 			} else {
 				env["GO_FAIL_METHOD"] = method
 			}
-			a, err := NewWithContext(t.Context(), Config{Command: helperCommandWithEnv(t, env), WorkingDir: t.TempDir(), LazyInitialization: true, SetupTimeout: 5 * time.Second})
+			a, err := NewWithContext(t.Context(), Config{Command: helperCommandWithEnv(t, env), WorkingDir: t.TempDir(), LazyInitialization: true, SetupTimeout: 100 * time.Millisecond, InitializeTimeout: 60 * time.Second})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -140,7 +148,6 @@ func TestLazyResumeTimeoutPreservesKnownID(t *testing.T) {
 			if err := a.ensureInitialized(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			a.setupTimeout = 100 * time.Millisecond
 			svc := session.InMemoryService()
 			created, err := svc.Create(t.Context(), &session.CreateRequest{AppName: "lazy", UserID: "u", State: map[string]any{SessionStateKey: map[string]any{"session_id": "known"}}})
 			if err != nil {

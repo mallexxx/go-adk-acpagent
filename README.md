@@ -143,6 +143,9 @@ Runnable examples are available for [OpenCode](examples/opencode),
 | Field | Purpose |
 | --- | --- |
 | `Command` | ACP subprocess argv. |
+| `LazyInitialization` | Defer process launch and initialize until invocation. |
+| `InitializeTimeout` | Bound gate wait, process launch, and initialize independently. Zero inherits `SetupTimeout`; negative is invalid. |
+| `SetupTimeout` | Bound session attachment; default initialize budget when `InitializeTimeout` is zero. |
 | `WorkingDir` | Process directory and default ACP session cwd. |
 | `Logger` | Adapter diagnostics through `*slog.Logger`. |
 | `Stderr` | ACP subprocess stderr forwarding. |
@@ -168,6 +171,41 @@ import "github.com/normahq/go-adk-acpagent/v2/acperror"
 | Choose a provider command | [Provider recipes](docs/provider-recipes.md) |
 | Manage cwd, session metadata, config values, plans, and output state | [Session state](docs/session-state.md) |
 | Debug startup, JSON-RPC streams, permissions, and provider errors | [Troubleshooting](docs/troubleshooting.md) |
+
+## Startup And Attachment Budgets
+
+Set independent budgets when cold initialize needs more time than session
+attachment:
+
+```go
+Config{
+    Command:           []string{"opencode", "acp"},
+    LazyInitialization: true,
+    InitializeTimeout: 60 * time.Second,
+    SetupTimeout:      10 * time.Second,
+}
+```
+
+`InitializeTimeout` covers waiting for initialization already in progress,
+process launch, and the ACP initialize handshake. It applies to eager and lazy
+initialization. Zero inherits `SetupTimeout` for compatibility; if both are
+zero, only caller and lifecycle cancellation/deadlines limit initialization.
+Negative values are rejected before launch. Earlier caller deadlines and
+application cancellation still win.
+
+`SetupTimeout` continues to bound session/new and session/resume attachment
+and related setup RPCs. Neither duration limits prompts or the lifetime of a
+healthy process. A successful client survives the initialization deadline and
+request cancellation, and later invocations reuse it. Lazy mode still performs
+no process launch until invocation.
+
+Call `Close` during shutdown. Cleanup closes stdin, allows 200ms for graceful
+exit, kills the owned immediate child if needed, and waits up to 5s more. An
+exceptional stalled process wait returns an explicit cleanup-timeout error;
+the original reaper remains responsible until the wait finishes. Initialization
+errors retain their cancellation/deadline cause, including when cleanup adds
+an error. Command wrapper descendants remain outside the immediate-child
+ownership contract.
 
 ## Production Notes
 
